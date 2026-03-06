@@ -22,9 +22,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::Context;
+use futures_util::stream;
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
 use tokio::io::AsyncWriteExt;
+use tokio_util::bytes::Bytes;
+use tokio_util::io::ReaderStream;
 
 use crate::discovery::{RestDescription, RestMethod};
 use crate::error::GwsError;
@@ -182,17 +185,17 @@ async fn build_http_request(
         if input.is_upload {
             let upload_path = upload_path.expect("upload_path must be Some when is_upload is true");
 
-            let file_bytes = tokio::fs::read(upload_path).await.map_err(|e| {
+            let file = tokio::fs::File::open(upload_path).await.map_err(|e| {
                 GwsError::Validation(format!(
-                    "Failed to read upload file '{}': {}",
+                    "Failed to open upload file '{}': {}",
                     upload_path, e
                 ))
             })?;
 
             request = request.query(&[("uploadType", "multipart")]);
-            let (multipart_body, content_type) = build_multipart_body(&input.body, &file_bytes)?;
+            let (body_stream, content_type) = build_multipart_stream(&input.body, file)?;
             request = request.header("Content-Type", content_type);
-            request = request.body(multipart_body);
+            request = request.body(reqwest::Body::wrap_stream(body_stream));
         } else if let Some(ref body_val) = input.body {
             request = request.header("Content-Type", "application/json");
             request = request.json(body_val);
@@ -728,13 +731,20 @@ fn handle_error_response<T>(
     })
 }
 
-/// Builds a multipart/related body for media upload requests.
+/// Builds a streaming multipart/related body for media upload requests.
 ///
-/// Returns the body bytes and the Content-Type header value (with boundary).
-fn build_multipart_body(
+/// Returns an async byte stream and the Content-Type header value (with boundary).
+/// The file is read in chunks, keeping memory usage O(1) regardless of file size.
+fn build_multipart_stream(
     metadata: &Option<Value>,
-    file_bytes: &[u8],
-) -> Result<(Vec<u8>, String), GwsError> {
+    file: tokio::fs::File,
+) -> Result<
+    (
+        impl futures_util::Stream<Item = Result<Bytes, std::io::Error>>,
+        String,
+    ),
+    GwsError,
+> {
     let boundary = format!("gws_boundary_{:016x}", rand::random::<u64>());
 
     // Determine the media MIME type from the metadata's mimeType field, or fall back
@@ -742,30 +752,38 @@ fn build_multipart_body(
         .as_ref()
         .and_then(|m| m.get("mimeType"))
         .and_then(|v| v.as_str())
-        .unwrap_or("application/octet-stream");
+        .unwrap_or("application/octet-stream")
+        .to_string();
 
-    // Build multipart/related body
+    // Build multipart/related body as a stream of three segments
     let metadata_json = metadata
         .as_ref()
         .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "{}".to_string()))
         .unwrap_or_else(|| "{}".to_string());
 
-    let mut body = Vec::new();
-    // Part 1: JSON metadata
-    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(b"Content-Type: application/json; charset=UTF-8\r\n\r\n");
-    body.extend_from_slice(metadata_json.as_bytes());
-    body.extend_from_slice(b"\r\n");
-    // Part 2: File content
-    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(format!("Content-Type: {media_mime}\r\n\r\n").as_bytes());
-    body.extend_from_slice(file_bytes);
-    body.extend_from_slice(b"\r\n");
+    // Part 1: JSON metadata + Part 2 header (small, built in memory)
+    let mut preamble = Vec::new();
+    preamble.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    preamble.extend_from_slice(b"Content-Type: application/json; charset=UTF-8\r\n\r\n");
+    preamble.extend_from_slice(metadata_json.as_bytes());
+    preamble.extend_from_slice(b"\r\n");
+    // Part 2 header: boundary + content-type for file
+    preamble.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    preamble.extend_from_slice(format!("Content-Type: {media_mime}\r\n\r\n").as_bytes());
+
     // Closing boundary
-    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    let epilogue = format!("\r\n--{boundary}--\r\n");
+
+    // Stream: preamble → file chunks → epilogue
+    let preamble_stream = stream::once(async { Ok(Bytes::from(preamble)) });
+    // Read file in fixed 64KB chunks to keep memory usage constant
+    let file_stream = ReaderStream::with_capacity(file, 64 * 1024);
+    let epilogue_stream = stream::once(async move { Ok(Bytes::from(epilogue)) });
+
+    let body_stream = preamble_stream.chain(file_stream).chain(epilogue_stream);
 
     let content_type = format!("multipart/related; boundary={boundary}");
-    Ok((body, content_type))
+    Ok((body_stream, content_type))
 }
 
 /// Validates a JSON body against a Discovery Document schema.
@@ -1184,17 +1202,31 @@ mod tests {
         assert!(err.to_string().contains("Expected object"));
     }
     #[tokio::test]
-    async fn test_build_multipart_body() {
+    async fn test_build_multipart_stream() {
         let metadata = Some(json!({ "name": "test.txt", "mimeType": "text/plain" }));
         let content = b"Hello world";
 
-        let (body, content_type) = build_multipart_body(&metadata, content).unwrap();
+        // Write content to a temp file to feed into the streaming builder
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), content).unwrap();
+        let file = tokio::fs::File::open(tmp.path()).await.unwrap();
+
+        let (stream, content_type) = build_multipart_stream(&metadata, file).unwrap();
 
         // Check content type has boundary
         assert!(content_type.starts_with("multipart/related; boundary="));
         let boundary = content_type.split("boundary=").nth(1).unwrap();
 
-        let body_str = String::from_utf8(body).unwrap();
+        // Collect stream into bytes
+        use futures_util::TryStreamExt;
+        let body_bytes: Vec<u8> = stream
+            .try_fold(Vec::new(), |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk);
+                Ok(acc)
+            })
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body_bytes).unwrap();
 
         // Verify structure
         assert!(body_str.contains(boundary));
@@ -1205,13 +1237,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_build_multipart_body_no_metadata() {
+    async fn test_build_multipart_stream_no_metadata() {
         let metadata = None;
         let content = b"Binary data";
 
-        let (body, content_type) = build_multipart_body(&metadata, content).unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), content).unwrap();
+        let file = tokio::fs::File::open(tmp.path()).await.unwrap();
+
+        let (stream, content_type) = build_multipart_stream(&metadata, file).unwrap();
         let boundary = content_type.split("boundary=").nth(1).unwrap();
-        let body_str = String::from_utf8(body).unwrap();
+
+        use futures_util::TryStreamExt;
+        let body_bytes: Vec<u8> = stream
+            .try_fold(Vec::new(), |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk);
+                Ok(acc)
+            })
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body_bytes).unwrap();
 
         assert!(body_str.contains(boundary));
         assert!(body_str.contains("application/octet-stream")); // Fallback mime
